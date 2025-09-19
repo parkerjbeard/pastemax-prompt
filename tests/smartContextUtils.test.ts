@@ -188,6 +188,7 @@ test('diff tokens reduce budget available for non-essential files', async () => 
     joinThreshold: 2,
     smallFileTokenThreshold: 400,
     tokenCounter: countTokensStub,
+    strictBudgetCap: false,
   });
 
   assert.ok(result.content.includes('<git_diff>'), 'Diff section should be included');
@@ -199,6 +200,45 @@ test('diff tokens reduce budget available for non-essential files', async () => 
     !result.content.includes('File: /repo/helper.ts'),
     'Helper file should be dropped when budget consumed by diff'
   );
+});
+
+test('strict cap partitions budget and trims diff to fit', async () => {
+  const changedFile = makeFile({
+    name: 'changed.ts',
+    path: '/repo/changed.ts',
+    content: 'line1\nline2\n',
+    tokenCount: 20,
+    size: 12,
+  });
+
+  // Create a relatively large diff so it requires trimming
+  const diffLines = Array.from({ length: 60 }, (_, i) => `+ added line ${i + 1}`).join('\n');
+  const diff = `diff --git a/changed.ts b/changed.ts\nindex 1..2 100644\n--- a/changed.ts\n+++ b/changed.ts\n@@ -1,1 +1,60 @@\n-line1\n${diffLines}\n`;
+
+  const budget = 50;
+  const res = await assembleSmartContextContent({
+    files: [changedFile],
+    selectedFiles: ['/repo/changed.ts'],
+    sortOrder: 'name-asc',
+    includeFileTree: false,
+    includeBinaryPaths: false,
+    selectedFolder: '/repo',
+    diffText: diff,
+    diffPaths: ['/repo/changed.ts'],
+    includeGitDiffs: true,
+    gitDiff: diff,
+    budgetTokens: budget,
+    contextLines: 1,
+    joinThreshold: 2,
+    smallFileTokenThreshold: 400,
+    tokenCounter: countTokensStub,
+    allocationPreference: 'diff',
+    strictBudgetCap: true,
+  });
+
+  // Hard cap: total token count should not exceed budget
+  assert.ok(res.tokenCount <= budget, `tokenCount ${res.tokenCount} should be <= ${budget}`);
+  assert.ok(res.content.includes('<git_diff>'), 'Diff should still be present (trimmed)');
 });
 
 test('diff path without hunks uses capped non-essential snippet', async () => {

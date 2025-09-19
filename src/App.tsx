@@ -2070,12 +2070,14 @@ const App = (): JSX.Element => {
     const upperBound = Math.min(modelCap, Math.floor(expandedEstimate * 1.2));
     const recommended = Math.floor(upperBound * SMART_CONTEXT_HEADROOM_RATIO);
 
-    if (Number.isFinite(recommended) && recommended > 0) {
-      setSmartContextBudgetTokens(recommended);
-    } else {
-      const fallback = Math.floor((diffTokenEstimate + changedFileTokens) * 0.8);
-      setSmartContextBudgetTokens(Math.max(1000, fallback));
-    }
+    const fallback = Math.floor((diffTokenEstimate + changedFileTokens) * 0.8);
+    const suggested =
+      Number.isFinite(recommended) && recommended > 0
+        ? recommended
+        : Math.max(1000, fallback);
+
+    // Do not reduce a user-entered larger budget. Only raise if suggestion is higher.
+    setSmartContextBudgetTokens((prev) => Math.max(prev, suggested));
   }, [allFiles, selectedFiles, selectedFilesDiff, selectedDiffPaths, selectedModelContextLength]);
 
   const handleModelContextChange = useCallback((model: ModelInfo | null) => {

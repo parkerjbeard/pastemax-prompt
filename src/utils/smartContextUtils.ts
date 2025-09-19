@@ -48,6 +48,7 @@ export interface SmartContextParams {
   smallFileTokenThreshold: number;
   tokenCounter?: (text: string) => Promise<number>;
   allocationPreference?: 'balanced' | 'diff' | 'excerpts';
+  strictBudgetCap?: boolean;
 }
 
 export interface SmartContextResult {
@@ -166,6 +167,7 @@ export async function assembleSmartContextContent(
     smallFileTokenThreshold,
     tokenCounter = countTokensCached,
     allocationPreference = 'balanced',
+    strictBudgetCap = false,
   } = params;
 
   const effectiveContext = Math.max(0, contextLines);
@@ -313,6 +315,51 @@ export async function assembleSmartContextContent(
       candidates.push(candidate);
     });
 
+  // Precompute overhead tokens (file map, binary list, wrappers)
+  let fileMapSection = '';
+  let fileMapTokens = 0;
+  if (includeFileTree && selectedFolder) {
+    const asciiTree = generateAsciiFileTree(sortedFiles, selectedFolder);
+    const normalizedFolder = normalizePath(selectedFolder);
+    fileMapSection = `<file_map>\n${normalizedFolder}\n${asciiTree}\n</file_map>\n`;
+    try {
+      fileMapTokens = await tokenCounter(fileMapSection);
+    } catch (error) {
+      console.error('Error estimating file map token count:', error);
+      fileMapTokens = 0;
+    }
+  }
+
+  // Binary list section (optional)
+  let binarySection = '';
+  let binaryTokens = 0;
+  if (includeBinaryPaths && binaryEntries.length > 0) {
+    let temp = '<binary_files>\n';
+    binaryEntries.forEach((entry) => {
+      temp += `${entry}\n`;
+    });
+    temp += '</binary_files>\n\n';
+    binarySection = temp;
+    try {
+      binaryTokens = await tokenCounter(binarySection);
+    } catch (error) {
+      console.error('Error estimating binary list token count:', error);
+      binaryTokens = 0;
+    }
+  }
+
+  // Wrappers around file contents
+  let wrappersTokens = 0;
+  try {
+    wrappersTokens = await tokenCounter('<file_contents>\n</file_contents>\n');
+  } catch (error) {
+    wrappersTokens = 0;
+  }
+
+  const enforceBudget = Number.isFinite(budgetTokens);
+  const overheadTokens = fileMapTokens + binaryTokens + wrappersTokens;
+
+  // Build diff section, and optionally trim to sub-budget in strict mode
   let diffSection = '';
   let diffTokens = 0;
   const trimmedGitDiff = includeGitDiffs && gitDiff ? gitDiff.trim() : '';
@@ -326,23 +373,38 @@ export async function assembleSmartContextContent(
     }
   }
 
-  const enforceBudget = Number.isFinite(budgetTokens);
-  let adjustedDiffCost = diffTokens;
-  if (allocationPreference === 'diff') {
-    adjustedDiffCost = Math.ceil(diffTokens * 1.3);
-  } else if (allocationPreference === 'excerpts') {
-    adjustedDiffCost = Math.floor(diffTokens * 0.7);
-  }
+  // If strictBudgetCap is enabled, partition the remaining budget between diff and excerpts
+  let excerptBudget = enforceBudget ? Math.max(budgetTokens - overheadTokens, 0) : budgetTokens;
+  if (strictBudgetCap && enforceBudget) {
+    const ratios = getAllocationRatios(allocationPreference);
+    const diffBudget = Math.max(Math.floor(excerptBudget * ratios.diff), 0);
+    const excerptsBudget = Math.max(excerptBudget - diffBudget, 0);
 
-  const availableBudget = enforceBudget
-    ? Math.max(budgetTokens - adjustedDiffCost, 0)
-    : budgetTokens;
+    if (trimmedGitDiff && diffTokens > diffBudget) {
+      const result = await trimDiffToBudget(trimmedGitDiff, diffBudget, tokenCounter);
+      diffSection = result.section;
+      diffTokens = result.tokens;
+    }
+
+    // Excerpts selection operates within its own sub-budget
+    excerptBudget = excerptsBudget;
+  } else {
+    // Non-strict mode: emulate historical behavior (adjust available budget by diff cost heuristic)
+    let adjustedDiffCost = diffTokens;
+    if (allocationPreference === 'diff') {
+      adjustedDiffCost = Math.ceil(diffTokens * 1.3);
+    } else if (allocationPreference === 'excerpts') {
+      adjustedDiffCost = Math.floor(diffTokens * 0.7);
+    }
+    excerptBudget = enforceBudget ? Math.max(budgetTokens - adjustedDiffCost, 0) : budgetTokens;
+  }
 
   const { included, totalTokens: excerptTokens } = await selectVariantsWithinBudget({
     candidates,
-    budgetTokens: availableBudget,
-    enforceBudget,
+    budgetTokens: excerptBudget,
+    enforceBudget, // always enforce budget; strict mode controls overflow behavior
     tokenCounter,
+    allowEssentialOverflow: !strictBudgetCap, // do not overflow in strict mode
   });
 
   let fileContents = '<file_contents>\n';
@@ -362,10 +424,8 @@ export async function assembleSmartContextContent(
 
   const sections: string[] = [];
 
-  if (includeFileTree && selectedFolder) {
-    const asciiTree = generateAsciiFileTree(sortedFiles, selectedFolder);
-    const normalizedFolder = normalizePath(selectedFolder);
-    sections.push(`<file_map>\n${normalizedFolder}\n${asciiTree}\n</file_map>\n`);
+  if (fileMapSection) {
+    sections.push(fileMapSection);
   }
 
   sections.push(fileContents);
@@ -736,13 +796,20 @@ interface SelectionParams {
   budgetTokens: number;
   enforceBudget?: boolean;
   tokenCounter: (text: string) => Promise<number>;
+  allowEssentialOverflow?: boolean;
 }
 
 async function selectVariantsWithinBudget(params: SelectionParams): Promise<{
   included: IncludedVariant[];
   totalTokens: number;
 }> {
-  const { candidates, budgetTokens, enforceBudget = false, tokenCounter } = params;
+  const {
+    candidates,
+    budgetTokens,
+    enforceBudget = false,
+    tokenCounter,
+    allowEssentialOverflow = true,
+  } = params;
   const sorted = [...candidates].sort((a, b) => a.priority - b.priority);
   const included: IncludedVariant[] = [];
 
@@ -768,7 +835,7 @@ async function selectVariantsWithinBudget(params: SelectionParams): Promise<{
       }
     }
 
-    if (!chosen && candidate.isEssential && smallestVariant) {
+    if (!chosen && candidate.isEssential && smallestVariant && allowEssentialOverflow) {
       // For essential content (diff excerpts), pick the smallest variant even if it exceeds the remaining budget.
       let tokens = smallestVariantTokens;
       if (tokens === null) {
@@ -796,4 +863,62 @@ function ensureTrailingNewline(text: string): string {
     return `${text}\n`;
   }
   return text;
+}
+
+function getAllocationRatios(
+  preference: 'balanced' | 'diff' | 'excerpts'
+): { diff: number; excerpts: number } {
+  switch (preference) {
+    case 'diff':
+      return { diff: 0.7, excerpts: 0.3 };
+    case 'excerpts':
+      return { diff: 0.3, excerpts: 0.7 };
+    case 'balanced':
+    default:
+      return { diff: 0.5, excerpts: 0.5 };
+  }
+}
+
+async function trimDiffToBudget(
+  diffBody: string,
+  maxTokens: number,
+  tokenCounter: (text: string) => Promise<number>
+): Promise<{ section: string; tokens: number }> {
+  if (maxTokens <= 0) {
+    return { section: '', tokens: 0 };
+  }
+
+  const buildSection = (lines: string[]): string => {
+    const inner = lines.join('\n');
+    return `<git_diff>\n\`\`\`diff\n${inner}\n\`\`\`\n</git_diff>\n`;
+  };
+
+  const allLines = diffBody.split(/\r?\n/);
+  // Quick check: even the wrapper may exceed budget, then skip entirely
+  const emptySection = buildSection([]);
+  const emptyTokens = await tokenCounter(emptySection);
+  if (emptyTokens > maxTokens) {
+    return { section: '', tokens: 0 };
+  }
+
+  let low = 0;
+  let high = allLines.length;
+  let bestN = 0;
+  let bestTokens = emptyTokens; // tokens for empty wrapper is baseline
+
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    const candidate = buildSection(allLines.slice(0, mid));
+    const candTokens = await tokenCounter(candidate);
+    if (candTokens <= maxTokens) {
+      bestN = mid;
+      bestTokens = candTokens;
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
+  }
+
+  const section = buildSection(allLines.slice(0, bestN));
+  return { section, tokens: bestTokens };
 }
