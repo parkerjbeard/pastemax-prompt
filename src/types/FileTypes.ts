@@ -3,6 +3,7 @@ import type {
   GitCommitSummary,
   GitCommitBackloadSegment,
   GitDiffPathAnnotation,
+  ChangedFileAddPayload,
 } from './GitTypes';
 
 export type IgnoreMode = 'automatic' | 'global';
@@ -51,6 +52,7 @@ export interface SidebarProps {
   gitChangesError: string | null;
   onRefreshGitChanges: () => Promise<unknown> | void;
   onAddChangedFilesSinceCommit: (commitHash: string) => void;
+  onAddSingleChangedFile: (payload: ChangedFileAddPayload) => void;
   gitCommitHistory: GitCommitSummary[];
   loadCommitHistory: (limit?: number) => Promise<unknown> | void;
   isCommitHistoryLoading: boolean;

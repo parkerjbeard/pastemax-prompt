@@ -9,6 +9,7 @@ import type {
   GitCommitSummary,
   GitCommitBackloadSegment,
   GitDiffPathAnnotation,
+  ChangedFileAddPayload,
 } from './types/GitTypes';
 import { ThemeProvider } from './context/ThemeContext';
 import IgnoreListModal from './components/IgnoreListModal';
@@ -79,6 +80,93 @@ const STORAGE_KEYS = {
   SMART_CONTEXT_ENABLED: 'pastemax-smart-context-enabled',
   SMART_CONTEXT_BUDGET_TOKENS: 'pastemax-smart-context-budget-tokens',
   SMART_CONTEXT_ALLOCATION: 'pastemax-smart-context-allocation',
+};
+
+const mergeCommitSegments = (
+  existing: GitCommitBackloadSegment[],
+  incoming: GitCommitBackloadSegment[]
+): GitCommitBackloadSegment[] => {
+  if (!incoming.length) {
+    return existing;
+  }
+
+  const byHash = new Map<string, GitCommitBackloadSegment>();
+
+  existing.forEach((segment) => {
+    byHash.set(segment.hash, {
+      ...segment,
+      files: segment.files.map((file) => ({
+        ...file,
+        absolutePath: normalizePath(file.absolutePath),
+        relativePath: file.relativePath ? normalizePath(file.relativePath) : '',
+      })),
+    });
+  });
+
+  incoming.forEach((segment) => {
+    const normalizedSegment: GitCommitBackloadSegment = {
+      ...segment,
+      files: segment.files.map((file) => ({
+        ...file,
+        absolutePath: normalizePath(file.absolutePath),
+        relativePath: file.relativePath ? normalizePath(file.relativePath) : '',
+      })),
+    };
+
+    const existingSegment = byHash.get(normalizedSegment.hash);
+    if (existingSegment) {
+      const existingPaths = new Set(
+        existingSegment.files.map((file) => normalizePath(file.absolutePath))
+      );
+
+      normalizedSegment.files.forEach((file) => {
+        const normalizedAbs = normalizePath(file.absolutePath);
+        if (!existingPaths.has(normalizedAbs)) {
+          existingSegment.files.push({
+            ...file,
+            absolutePath: normalizedAbs,
+            relativePath: file.relativePath ? normalizePath(file.relativePath) : '',
+          });
+          existingPaths.add(normalizedAbs);
+        }
+      });
+
+      existingSegment.order = Math.min(existingSegment.order, normalizedSegment.order);
+      if (!existingSegment.subject && normalizedSegment.subject) {
+        existingSegment.subject = normalizedSegment.subject;
+      }
+      if (!existingSegment.isoDate && normalizedSegment.isoDate) {
+        existingSegment.isoDate = normalizedSegment.isoDate;
+      }
+      if (existingSegment.timestamp == null && normalizedSegment.timestamp != null) {
+        existingSegment.timestamp = normalizedSegment.timestamp;
+      }
+    } else {
+      byHash.set(normalizedSegment.hash, {
+        ...normalizedSegment,
+        files: normalizedSegment.files.map((file) => ({
+          ...file,
+          absolutePath: normalizePath(file.absolutePath),
+          relativePath: file.relativePath ? normalizePath(file.relativePath) : '',
+        })),
+      });
+    }
+  });
+
+  const merged = Array.from(byHash.values()).filter((segment) => segment.files.length > 0);
+
+  merged.sort((a, b) => {
+    if (a.timestamp != null && b.timestamp != null && a.timestamp !== b.timestamp) {
+      return a.timestamp - b.timestamp;
+    }
+    if (a.order !== b.order) return a.order - b.order;
+    return a.hash.localeCompare(b.hash);
+  });
+
+  return merged.map((segment, index) => ({
+    ...segment,
+    order: index + 1,
+  }));
 };
 
 const SMART_CONTEXT_DEFAULT_CONTEXT_LINES = 12;
@@ -999,6 +1087,32 @@ const App = (): JSX.Element => {
         return [...prev, normalizedPath];
       }
     });
+  };
+
+  const handleAddSingleChangedFile = ({
+    absolutePath,
+    commitSegments,
+  }: ChangedFileAddPayload) => {
+    if (!absolutePath) return;
+
+    const normalizedPath = normalizePath(absolutePath);
+    const file = allFiles.find((f: FileData) => arePathsEqual(f.path, normalizedPath));
+    if (file?.isBinary && !includeBinaryPaths) {
+      return;
+    }
+
+    setSelectedFiles((prev: string[]) => {
+      if (prev.some((path) => arePathsEqual(path, normalizedPath))) {
+        return prev;
+      }
+      return [...prev, normalizedPath];
+    });
+
+    if (commitSegments?.length) {
+      setBackloadedCommitSegments((previous) =>
+        mergeCommitSegments(previous, commitSegments)
+      );
+    }
   };
 
   // Toggle folder selection (select/deselect all files in folder)
@@ -2160,65 +2274,9 @@ const App = (): JSX.Element => {
           .filter(Boolean) as GitCommitBackloadSegment[];
 
         if (normalizedSegments.length > 0) {
-          setBackloadedCommitSegments((previous) => {
-            const byHash = new Map<string, GitCommitBackloadSegment>();
-            previous.forEach((segment) => {
-              byHash.set(segment.hash, {
-                ...segment,
-                files: [...segment.files],
-              });
-            });
-
-            normalizedSegments.forEach((segment) => {
-              const existing = byHash.get(segment.hash);
-              if (existing) {
-                const existingPaths = new Set(
-                  existing.files.map((file) => normalizePath(file.absolutePath))
-                );
-                segment.files.forEach((file) => {
-                  const normalizedAbs = normalizePath(file.absolutePath);
-                  if (!existingPaths.has(normalizedAbs)) {
-                    existing.files.push({ ...file, absolutePath: normalizedAbs });
-                    existingPaths.add(normalizedAbs);
-                  }
-                });
-                existing.order = Math.min(existing.order, segment.order);
-                if (!existing.subject && segment.subject) {
-                  existing.subject = segment.subject;
-                }
-                if (!existing.isoDate && segment.isoDate) {
-                  existing.isoDate = segment.isoDate;
-                }
-                if (existing.timestamp == null && segment.timestamp != null) {
-                  existing.timestamp = segment.timestamp;
-                }
-              } else {
-                byHash.set(segment.hash, {
-                  ...segment,
-                  files: segment.files.map((file) => ({
-                    ...file,
-                    absolutePath: normalizePath(file.absolutePath),
-                  })),
-                });
-              }
-            });
-
-            const merged = Array.from(byHash.values()).filter(
-              (segment) => segment.files.length > 0
-            );
-            merged.sort((a, b) => {
-              if (a.timestamp != null && b.timestamp != null && a.timestamp !== b.timestamp) {
-                return a.timestamp - b.timestamp;
-              }
-              if (a.order !== b.order) return a.order - b.order;
-              return a.hash.localeCompare(b.hash);
-            });
-
-            return merged.map((segment, index) => ({
-              ...segment,
-              order: index + 1,
-            }));
-          });
+          setBackloadedCommitSegments((previous) =>
+            mergeCommitSegments(previous, normalizedSegments)
+          );
         }
       }
 
@@ -2497,6 +2555,7 @@ const App = (): JSX.Element => {
               gitChangesError={gitChangesError}
               onRefreshGitChanges={refreshGitChangedFiles}
               onAddChangedFilesSinceCommit={handleAddFilesSinceCommit}
+              onAddSingleChangedFile={handleAddSingleChangedFile}
               gitCommitHistory={gitCommitHistory}
               loadCommitHistory={loadCommitHistory}
               isCommitHistoryLoading={isCommitHistoryLoading}

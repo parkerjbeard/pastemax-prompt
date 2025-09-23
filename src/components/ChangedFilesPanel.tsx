@@ -4,6 +4,7 @@ import type {
   GitCommitSummary,
   GitDiffPathAnnotation,
   GitCommitBackloadSegment,
+  ChangedFileAddPayload,
 } from '../types/GitTypes';
 import { arePathsEqual, normalizePath } from '../utils/pathUtils';
 import {
@@ -25,7 +26,7 @@ interface ChangedFilesPanelProps {
   gitChangesError: string | null;
   onRefreshChanges: () => Promise<unknown> | void;
   onAddAll: () => void;
-  onAddSingle: (filePath: string) => void;
+  onAddSingle: (payload: ChangedFileAddPayload) => void;
   onAddSinceCommit: (commitHash: string) => void;
   gitCommitHistory: GitCommitSummary[];
   loadCommitHistory: (limit?: number) => Promise<unknown> | void;
@@ -69,6 +70,9 @@ const ChangedFilesPanel = ({
 }: ChangedFilesPanelProps) => {
   const [selectedCommit, setSelectedCommit] = useState('');
   const [filesForCommit, setFilesForCommit] = useState<GitChangedFile[]>([]);
+  const [commitSegmentsForSelected, setCommitSegmentsForSelected] = useState<
+    GitCommitBackloadSegment[]
+  >([]);
   const [isLoadingCommitFiles, setIsLoadingCommitFiles] = useState(false);
   const [isCommitRangeCollapsed, setIsCommitRangeCollapsed] = useState(false);
   const lastFolderRef = useRef<string | null>(null);
@@ -104,11 +108,13 @@ const ChangedFilesPanel = ({
   useEffect(() => {
     if (!selectedCommit || !normalizedFolder) {
       setFilesForCommit([]);
+      setCommitSegmentsForSelected([]);
       return;
     }
 
     const loadFilesForCommit = async () => {
       setIsLoadingCommitFiles(true);
+      setCommitSegmentsForSelected([]);
       try {
         if (!(window as any).electron?.ipcRenderer) {
           console.error('Electron IPC not available');
@@ -159,9 +165,83 @@ const ChangedFilesPanel = ({
           console.log('No files in result:', result);
           setFilesForCommit([]);
         }
+
+        if (Array.isArray(result?.commitSegments)) {
+          const normalizedSegments = (result.commitSegments as any[])
+            .map((segment: any) => {
+              if (!segment) return null;
+
+              const rawFiles = Array.isArray(segment.files) ? segment.files : [];
+              const files = rawFiles
+                .map((file: any) => {
+                  if (!file) return null;
+
+                  const absCandidate =
+                    typeof file === 'string'
+                      ? file
+                      : file.absolutePath || file.absPath || file.path || '';
+                  const absolutePath = normalizePath(absCandidate);
+                  if (!absolutePath) return null;
+
+                  const relativeCandidate =
+                    typeof file === 'string'
+                      ? file
+                      : file.relativePath || file.repoRelativePath || '';
+                  const relativePath = relativeCandidate ? normalizePath(relativeCandidate) : '';
+
+                  return {
+                    absolutePath,
+                    relativePath,
+                  };
+                })
+                .filter(Boolean);
+
+              if (!files.length) return null;
+
+              const orderValue = Number.isFinite(Number(segment.order))
+                ? Number(segment.order)
+                : Number.MAX_SAFE_INTEGER;
+
+              const timestamp =
+                typeof segment.timestamp === 'number' && Number.isFinite(segment.timestamp)
+                  ? segment.timestamp
+                  : null;
+
+              return {
+                hash: typeof segment.hash === 'string' ? segment.hash : String(segment.hash || ''),
+                subject:
+                  typeof segment.subject === 'string'
+                    ? segment.subject
+                    : String(segment.subject || ''),
+                timestamp,
+                isoDate: typeof segment.isoDate === 'string' ? segment.isoDate : null,
+                order: orderValue,
+                files,
+              } as GitCommitBackloadSegment;
+            })
+            .filter(Boolean) as GitCommitBackloadSegment[];
+
+          const sorted = [...normalizedSegments].sort((a, b) => {
+            if (a.timestamp != null && b.timestamp != null && a.timestamp !== b.timestamp) {
+              return a.timestamp - b.timestamp;
+            }
+            if (a.order !== b.order) return a.order - b.order;
+            return a.hash.localeCompare(b.hash);
+          });
+
+          setCommitSegmentsForSelected(
+            sorted.map((segment, index) => ({
+              ...segment,
+              order: index + 1,
+            }))
+          );
+        } else {
+          setCommitSegmentsForSelected([]);
+        }
       } catch (error) {
         console.error('Error loading files for commit:', error);
         setFilesForCommit([]);
+        setCommitSegmentsForSelected([]);
       } finally {
         setIsLoadingCommitFiles(false);
       }
@@ -179,6 +259,38 @@ const ChangedFilesPanel = ({
         : normalizedPath;
     },
     [normalizedFolder]
+  );
+
+  const pickCommitSegmentsForPath = useCallback(
+    (absPath: string) => {
+      if (!absPath || !commitSegmentsForSelected.length) {
+        return [] as GitCommitBackloadSegment[];
+      }
+
+      const normalizedTarget = normalizePath(absPath);
+
+      return commitSegmentsForSelected
+        .map((segment) => {
+          const matchingFiles = segment.files
+            .map((file) => ({
+              ...file,
+              absolutePath: normalizePath(file.absolutePath),
+              relativePath: file.relativePath ? normalizePath(file.relativePath) : '',
+            }))
+            .filter((file) => arePathsEqual(file.absolutePath, normalizedTarget));
+
+          if (!matchingFiles.length) {
+            return null;
+          }
+
+          return {
+            ...segment,
+            files: matchingFiles,
+          };
+        })
+        .filter(Boolean) as GitCommitBackloadSegment[];
+    },
+    [commitSegmentsForSelected]
   );
 
   const selectedDiffSet = useMemo(() => {
@@ -223,9 +335,9 @@ const ChangedFilesPanel = ({
         const absPath = normalizePath(file.absolutePath);
         const alreadySelected = selectedFiles.some((path) => arePathsEqual(path, absPath));
         const annotationsForFile = diffAnnotationMap.get(absPath) || [];
-        const hasWorkingTreeDiff = annotationsForFile.some(
-          (annotation) => annotation.source === 'working-tree'
-        );
+        const hasWorkingTreeDiff =
+          annotationsForFile.some((annotation) => annotation.source === 'working-tree') ||
+          selectedDiffSet.has(absPath);
         const commitAnnotation = annotationsForFile.find(
           (annotation) => annotation.source === 'commit'
         );
@@ -291,7 +403,6 @@ const ChangedFilesPanel = ({
     selectedCommit,
     selectedFiles,
     relativeDisplay,
-    selectedDiffSet,
     isLoadingCommitFiles,
     diffAnnotationMap,
     commitMetadataMap,
@@ -311,6 +422,23 @@ const ChangedFilesPanel = ({
       return;
     }
     onAddSinceCommit(selectedCommit);
+  };
+
+  const handleAddSingleFile = (absPath: string) => {
+    if (!absPath) return;
+
+    const payload: ChangedFileAddPayload = {
+      absolutePath: absPath,
+    };
+
+    if (selectedCommit) {
+      const segments = pickCommitSegmentsForPath(absPath);
+      if (segments.length) {
+        payload.commitSegments = segments;
+      }
+    }
+
+    onAddSingle(payload);
   };
 
   const handleRefreshCommits = () => {
@@ -411,7 +539,7 @@ const ChangedFilesPanel = ({
                       <button
                         className="text-button"
                         title="Add this file"
-                        onClick={() => onAddSingle(absPath)}
+                        onClick={() => handleAddSingleFile(absPath)}
                       >
                         <Plus size={14} /> Add
                       </button>

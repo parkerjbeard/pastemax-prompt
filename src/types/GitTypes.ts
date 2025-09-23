@@ -41,3 +41,8 @@ export interface GitDiffPathAnnotation {
   commitHash?: string;
   commitOrder?: number;
 }
+
+export interface ChangedFileAddPayload {
+  absolutePath: string;
+  commitSegments?: GitCommitBackloadSegment[];
+}

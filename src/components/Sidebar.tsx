@@ -35,6 +35,7 @@ const Sidebar = ({
   gitChangesError,
   onRefreshGitChanges,
   onAddChangedFilesSinceCommit,
+  onAddSingleChangedFile,
   gitCommitHistory,
   loadCommitHistory,
   isCommitHistoryLoading,
@@ -434,7 +435,7 @@ const Sidebar = ({
           gitChangesError={gitChangesError}
           onRefreshChanges={onRefreshGitChanges}
           onAddAll={selectChangedFiles}
-          onAddSingle={(p) => toggleFileSelection(p)}
+          onAddSingle={onAddSingleChangedFile}
           onAddSinceCommit={onAddChangedFilesSinceCommit}
           gitCommitHistory={gitCommitHistory}
           loadCommitHistory={loadCommitHistory}
