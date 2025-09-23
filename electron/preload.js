@@ -12,6 +12,19 @@ function ensureSerializable(data) {
     return data;
   }
 
+  // Handle boxed primitives (e.g., new String('...'))
+  if (data instanceof String) {
+    return data.toString();
+  }
+  if (typeof Buffer !== 'undefined' && Buffer.isBuffer && Buffer.isBuffer(data)) {
+    // Convert buffers to UTF-8 strings by default
+    try {
+      return data.toString('utf8');
+    } catch {
+      return String(data);
+    }
+  }
+
   // For arrays, map each item
   if (Array.isArray(data)) {
     return data.map(ensureSerializable);

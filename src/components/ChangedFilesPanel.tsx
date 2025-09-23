@@ -1,5 +1,10 @@
 import { useEffect, useMemo, useState, useRef, useCallback } from 'react';
-import type { GitChangedFile, GitCommitSummary } from '../types/GitTypes';
+import type {
+  GitChangedFile,
+  GitCommitSummary,
+  GitDiffPathAnnotation,
+  GitCommitBackloadSegment,
+} from '../types/GitTypes';
 import { arePathsEqual, normalizePath } from '../utils/pathUtils';
 import {
   RefreshCw,
@@ -15,6 +20,7 @@ interface ChangedFilesPanelProps {
   changedFiles: GitChangedFile[];
   selectedFiles: string[];
   selectedDiffPaths: string[];
+  diffAnnotations: GitDiffPathAnnotation[];
   gitChangesLoading: boolean;
   gitChangesError: string | null;
   onRefreshChanges: () => Promise<unknown> | void;
@@ -25,12 +31,19 @@ interface ChangedFilesPanelProps {
   loadCommitHistory: (limit?: number) => Promise<unknown> | void;
   isCommitHistoryLoading: boolean;
   commitHistoryError: string | null;
+  backloadedCommitSegments: GitCommitBackloadSegment[];
 }
 
 const formatCommitLabel = (commit: GitCommitSummary) => {
   const shortHash = commit.hash.substring(0, 7);
-  const date = commit.isoDate ? new Date(commit.isoDate) : commit.timestamp ? new Date(commit.timestamp * 1000) : null;
-  const formattedDate = date ? `${(date.getMonth() + 1).toString().padStart(2, '0')}/${date.getDate().toString().padStart(2, '0')}/${date.getFullYear()}, ${date.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true })}` : 'Unknown';
+  const date = commit.isoDate
+    ? new Date(commit.isoDate)
+    : commit.timestamp
+      ? new Date(commit.timestamp * 1000)
+      : null;
+  const formattedDate = date
+    ? `${(date.getMonth() + 1).toString().padStart(2, '0')}/${date.getDate().toString().padStart(2, '0')}/${date.getFullYear()}, ${date.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true })}`
+    : 'Unknown';
   const subject = commit.subject || '(no message)';
   const truncatedSubject = subject.length > 40 ? subject.substring(0, 37) + '...' : subject;
   return `${shortHash} • ${formattedDate} • ${truncatedSubject}`;
@@ -51,6 +64,8 @@ const ChangedFilesPanel = ({
   loadCommitHistory,
   isCommitHistoryLoading,
   commitHistoryError,
+  diffAnnotations,
+  backloadedCommitSegments,
 }: ChangedFilesPanelProps) => {
   const [selectedCommit, setSelectedCommit] = useState('');
   const [filesForCommit, setFilesForCommit] = useState<GitChangedFile[]>([]);
@@ -104,7 +119,7 @@ const ChangedFilesPanel = ({
         const result = await (window as any).electron.ipcRenderer.invoke('get-files-since-commit', {
           folderPath: normalizedFolder,
           commit: selectedCommit,
-          includeWorkingTree: true,  // Include uncommitted changes
+          includeWorkingTree: true, // Include uncommitted changes
         });
 
         console.log('Files for commit result:', result);
@@ -121,12 +136,8 @@ const ChangedFilesPanel = ({
             .map((file: any) => {
               // Handle both string paths and object formats
               const isString = typeof file === 'string';
-              const absolutePath = isString
-                ? file
-                : (file.absolutePath || file.path || '');
-              const relativePath = isString
-                ? file
-                : (file.relativePath || file.path || '');
+              const absolutePath = isString ? file : file.absolutePath || file.path || '';
+              const relativePath = isString ? file : file.relativePath || file.path || '';
 
               // Skip invalid entries
               if (!absolutePath) return null;
@@ -174,6 +185,29 @@ const ChangedFilesPanel = ({
     return new Set(selectedDiffPaths.map((p) => normalizePath(p)));
   }, [selectedDiffPaths]);
 
+  const diffAnnotationMap = useMemo(() => {
+    const map = new Map<string, GitDiffPathAnnotation[]>();
+    diffAnnotations.forEach((annotation) => {
+      if (!annotation || !annotation.absolutePath) return;
+      const normalized = normalizePath(annotation.absolutePath);
+      if (!normalized) return;
+      if (!map.has(normalized)) {
+        map.set(normalized, []);
+      }
+      map.get(normalized)!.push(annotation);
+    });
+    return map;
+  }, [diffAnnotations]);
+
+  const commitMetadataMap = useMemo(() => {
+    const map = new Map<string, GitCommitBackloadSegment>();
+    backloadedCommitSegments.forEach((segment) => {
+      if (!segment || !segment.hash) return;
+      map.set(segment.hash, segment);
+    });
+    return map;
+  }, [backloadedCommitSegments]);
+
   const displayEntries = useMemo(() => {
     // Use commit-specific files if a commit is selected, otherwise use current changed files
     const filesToDisplay = selectedCommit && !isLoadingCommitFiles ? filesForCommit : changedFiles;
@@ -184,14 +218,47 @@ const ChangedFilesPanel = ({
     }
 
     return filesToDisplay
-      .filter((file) => file && file.absolutePath) // Filter out invalid entries
+      .filter((file) => file && (file as any).absolutePath) // Filter out invalid entries
       .map((file) => {
         const absPath = normalizePath(file.absolutePath);
         const alreadySelected = selectedFiles.some((path) => arePathsEqual(path, absPath));
-        const hasDiff = selectedDiffSet.has(absPath);
+        const annotationsForFile = diffAnnotationMap.get(absPath) || [];
+        const hasWorkingTreeDiff = annotationsForFile.some(
+          (annotation) => annotation.source === 'working-tree'
+        );
+        const commitAnnotation = annotationsForFile.find(
+          (annotation) => annotation.source === 'commit'
+        );
+        let commitBadgeLabel: string | null = null;
+        let commitBadgeTitle: string | undefined;
+        const commitInfo = commitAnnotation?.commitHash
+          ? commitMetadataMap.get(commitAnnotation.commitHash)
+          : undefined;
+
+        if (commitAnnotation) {
+          const orderNumber = commitAnnotation.commitOrder;
+          if (typeof orderNumber === 'number' && Number.isFinite(orderNumber)) {
+            commitBadgeLabel = `Commit ${String(orderNumber).padStart(2, '0')}`;
+          } else {
+            commitBadgeLabel = 'Commit';
+          }
+
+          const titleParts: string[] = [];
+          if (commitInfo?.subject) {
+            titleParts.push(commitInfo.subject);
+          }
+          if (commitInfo?.isoDate) {
+            titleParts.push(commitInfo.isoDate);
+          }
+          if (!titleParts.length && commitAnnotation.commitHash) {
+            titleParts.push(commitAnnotation.commitHash);
+          }
+          commitBadgeTitle = titleParts.join(' • ');
+        }
 
         // Compute status - prefer explicit status, then combine index and worktree
-        let computedStatus = file.status;
+        let computedStatus: string | undefined =
+          typeof (file as any).status === 'string' ? (file as any).status : undefined;
         if (!computedStatus && (file.indexStatus || file.worktreeStatus)) {
           computedStatus = `${file.indexStatus || ' '}${file.worktreeStatus || ' '}`;
         }
@@ -204,15 +271,31 @@ const ChangedFilesPanel = ({
 
         return {
           absPath,
-          relativePath: file.relativePath || relativeDisplay(absPath),
+          relativePath:
+            typeof (file as any).relativePath === 'string'
+              ? (file as any).relativePath
+              : relativeDisplay(absPath),
           status: computedStatus,
           isUntracked: file.isUntracked || false,
           alreadySelected,
-          hasDiff,
+          hasWorkingTreeDiff,
+          commitAnnotation,
+          commitBadgeLabel,
+          commitBadgeTitle,
         };
       })
       .sort((a, b) => a.relativePath.localeCompare(b.relativePath));
-  }, [changedFiles, filesForCommit, selectedCommit, selectedFiles, relativeDisplay, selectedDiffSet, isLoadingCommitFiles]);
+  }, [
+    changedFiles,
+    filesForCommit,
+    selectedCommit,
+    selectedFiles,
+    relativeDisplay,
+    selectedDiffSet,
+    isLoadingCommitFiles,
+    diffAnnotationMap,
+    commitMetadataMap,
+  ]);
 
   const changedCount = displayEntries.length;
 
@@ -251,7 +334,9 @@ const ChangedFilesPanel = ({
     <div className="changes-panel">
       <div className="changes-header">
         <div className="changes-title">
-          {selectedCommit ? `All changes since commit (${changedCount})` : `Uncommitted changes (${changedCount})`}
+          {selectedCommit
+            ? `All changes since commit (${changedCount})`
+            : `Uncommitted changes (${changedCount})`}
         </div>
         <div className="changes-actions">
           <button
@@ -265,7 +350,11 @@ const ChangedFilesPanel = ({
           <button
             className="primary"
             onClick={handleAddAllDisplayed}
-            title={selectedCommit ? "Add all files since selected commit" : "Add all uncommitted changes to selection"}
+            title={
+              selectedCommit
+                ? 'Add all files since selected commit'
+                : 'Add all uncommitted changes to selection'
+            }
             disabled={gitChangesLoading || isLoadingCommitFiles || changedCount === 0}
           >
             Add All
@@ -283,36 +372,54 @@ const ChangedFilesPanel = ({
         )}
         {!gitChangesLoading && !isLoadingCommitFiles && !gitChangesError && changedCount === 0 && (
           <div className="changes-empty">
-            {selectedCommit ? 'No files changed since selected commit.' : 'No uncommitted changes in this folder.'}
+            {selectedCommit
+              ? 'No files changed since selected commit.'
+              : 'No uncommitted changes in this folder.'}
           </div>
         )}
 
         {!gitChangesLoading && !isLoadingCommitFiles && !gitChangesError && changedCount > 0 && (
           <ul>
-            {displayEntries.map(({ absPath, relativePath, status, isUntracked, alreadySelected, hasDiff }) => (
-              <li key={absPath} className="change-item">
-                <div className="change-meta">
-                  <span className={`change-status-badge ${isUntracked ? 'untracked' : ''}`}>
-                    {status || (isUntracked ? '??' : '--')}
+            {displayEntries.map(
+              ({
+                absPath,
+                relativePath,
+                status,
+                isUntracked,
+                alreadySelected,
+                hasWorkingTreeDiff,
+                commitBadgeLabel,
+                commitBadgeTitle,
+              }) => (
+                <li key={absPath} className="change-item">
+                  <div className="change-meta">
+                    <span className={`change-status-badge ${isUntracked ? 'untracked' : ''}`}>
+                      {status || (isUntracked ? '??' : '--')}
+                    </span>
+                    <span className="change-path">{relativePath}</span>
+                    {hasWorkingTreeDiff && <span className="change-badge">Diff</span>}
+                    {commitBadgeLabel && (
+                      <span className="change-badge commit-badge" title={commitBadgeTitle}>
+                        {commitBadgeLabel}
+                      </span>
+                    )}
+                  </div>
+                  <span className="change-actions">
+                    {alreadySelected ? (
+                      <span className="change-added">Added</span>
+                    ) : (
+                      <button
+                        className="text-button"
+                        title="Add this file"
+                        onClick={() => onAddSingle(absPath)}
+                      >
+                        <Plus size={14} /> Add
+                      </button>
+                    )}
                   </span>
-                  <span className="change-path">{relativePath}</span>
-                  {hasDiff && <span className="change-badge">Diff</span>}
-                </div>
-                <span className="change-actions">
-                  {alreadySelected ? (
-                    <span className="change-added">Added</span>
-                  ) : (
-                    <button
-                      className="text-button"
-                      title="Add this file"
-                      onClick={() => onAddSingle(absPath)}
-                    >
-                      <Plus size={14} /> Add
-                    </button>
-                  )}
-                </span>
-              </li>
-            ))}
+                </li>
+              )
+            )}
           </ul>
         )}
       </div>
@@ -369,7 +476,9 @@ const ChangedFilesPanel = ({
                 Add Since
               </button>
             </div>
-            <div className="commit-hint">Adds all files changed since the selected commit (including uncommitted changes).</div>
+            <div className="commit-hint">
+              Adds all files changed since the selected commit (including uncommitted changes).
+            </div>
           </div>
         )}
       </div>

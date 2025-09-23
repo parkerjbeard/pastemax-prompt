@@ -8,7 +8,11 @@
     "moduleResolution": "node",
     "types": ["node"],
     "noEmit": false,
-    "allowImportingTsExtensions": false
+    "allowImportingTsExtensions": false,
+    "baseUrl": ".",
+    "paths": {
+      "tiktoken/lite/tiktoken_bg.wasm?url": ["tests/stubs/tiktoken-wasm-url"]
+    }
   },
   "include": [
     "src/global.d.ts",

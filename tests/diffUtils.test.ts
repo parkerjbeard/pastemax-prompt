@@ -35,3 +35,11 @@ test('parseUnifiedDiff ignores deleted files', () => {
   const diffMap = parseUnifiedDiff(diff);
   assert.equal(diffMap.size, 0);
 });
+
+test('parseUnifiedDiff skips commit header annotations before diff blocks', () => {
+  const diffWithHeader = `# Commit 01 abcdef0 Test commit\n# Date 2024-01-01T00:00:00.000Z\n${DIFF_SAMPLE}`;
+  const diffMap = parseUnifiedDiff(diffWithHeader);
+  const entry = diffMap.get('src/foo.ts');
+  assert.ok(entry, 'Expected diff entry for src/foo.ts even with header lines');
+  assert.equal(entry.length, 3);
+});

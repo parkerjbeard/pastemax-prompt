@@ -40,6 +40,8 @@ const Sidebar = ({
   isCommitHistoryLoading,
   commitHistoryError,
   selectedDiffPaths,
+  diffAnnotations,
+  backloadedCommitSegments,
   expandedNodes,
   toggleExpanded,
   includeBinaryPaths,
@@ -393,7 +395,7 @@ const Sidebar = ({
         <button
           className={`sidebar-action-btn ${isChangesPanelOpen ? 'active' : ''}`}
           title="Toggle Git changes panel"
-          onClick={() => setIsChangesPanelOpen(prev => !prev)}
+          onClick={() => setIsChangesPanelOpen((prev) => !prev)}
           aria-label="Toggle Git changes panel"
           type="button"
         >
@@ -426,6 +428,8 @@ const Sidebar = ({
           selectedFiles={selectedFiles}
           changedFiles={gitChangedFiles}
           selectedDiffPaths={selectedDiffPaths}
+          diffAnnotations={diffAnnotations}
+          backloadedCommitSegments={backloadedCommitSegments}
           gitChangesLoading={gitChangesLoading}
           gitChangesError={gitChangesError}
           onRefreshChanges={onRefreshGitChanges}
@@ -439,8 +443,8 @@ const Sidebar = ({
         />
       )}
 
-      {!isChangesPanelOpen && (
-        allFiles.length > 0 ? (
+      {!isChangesPanelOpen &&
+        (allFiles.length > 0 ? (
           isTreeBuildingComplete ? (
             <div className="file-tree">{renderedTreeItems}</div>
           ) : (
@@ -451,8 +455,7 @@ const Sidebar = ({
           )
         ) : (
           <div className="tree-empty">No files found in this folder.</div>
-        )
-      )}
+        ))}
 
       <div
         className="sidebar-resize-handle"

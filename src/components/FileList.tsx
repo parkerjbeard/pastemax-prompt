@@ -60,16 +60,22 @@ const FileList = ({ files, selectedFiles, toggleFileSelection }: FileListProps) 
     ));
   }, [displayableFiles, toggleFileSelection, handlePreview]);
 
+  const emptyStateMessage = useMemo(() => {
+    if (displayableFiles.length > 0) return '';
+    if (files.length === 0) {
+      return selectedFiles.length > 0
+        ? 'No selected files match the current filters.'
+        : 'No files available yet. Select files from the sidebar or refresh.';
+    }
+    return 'No files selected. Select files from the sidebar.';
+  }, [displayableFiles.length, files.length, selectedFiles.length]);
+
   return (
     <div className="file-list-container">
       {displayableFiles.length > 0 ? (
         <div className="file-list">{renderedFileCards}</div>
       ) : (
-        <div className="file-list-empty">
-          {files.length > 0
-            ? 'No files selected. Select files from the sidebar.'
-            : 'Select a folder to view files'}
-        </div>
+        <div className="file-list-empty">{emptyStateMessage}</div>
       )}
       <FilePreviewModal
         isOpen={previewModalOpen}

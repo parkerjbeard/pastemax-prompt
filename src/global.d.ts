@@ -44,6 +44,14 @@ declare module 'tiktoken/encoders/*.json' {
   };
   export default data;
 }
+declare module 'tiktoken/lite/tiktoken_bg.wasm?url' {
+  const url: string;
+  export default url;
+}
+declare module '*.wasm?url' {
+  const url: string;
+  export default url;
+}
 declare module 'ignore';
 declare module 'gpt-3-encoder';
 

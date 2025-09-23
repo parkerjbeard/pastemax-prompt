@@ -15,7 +15,29 @@ export interface GitCommitSummary {
   isoDate: string | null;
 }
 
+export interface GitCommitFileInfo {
+  relativePath: string;
+  absolutePath: string;
+}
+
+export interface GitCommitBackloadSegment {
+  hash: string;
+  subject: string;
+  timestamp: number | null;
+  isoDate: string | null;
+  order: number;
+  files: GitCommitFileInfo[];
+}
+
 export interface GitDiffResult {
   diff: string;
   changedPaths: string[];
+  annotatedPaths?: GitDiffPathAnnotation[];
+}
+
+export interface GitDiffPathAnnotation {
+  absolutePath: string;
+  source: 'working-tree' | 'commit';
+  commitHash?: string;
+  commitOrder?: number;
 }

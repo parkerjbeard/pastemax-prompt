@@ -207,14 +207,70 @@ ipcMain.on('open-folder', async (event, arg) => {
 const NULL_DEVICE = process.platform === 'win32' ? 'NUL' : '/dev/null';
 const DEFAULT_GIT_TIMEOUT = 15000;
 
+let cachedGitPath = null;
+function resolveGitPath() {
+  if (cachedGitPath) return cachedGitPath;
+
+  const envCandidate = process.env.GIT_BINARY;
+  const candidates = [];
+
+  if (envCandidate) candidates.push(envCandidate);
+
+  if (process.platform === 'darwin') {
+    candidates.push('/opt/homebrew/bin/git', '/usr/local/bin/git', '/usr/bin/git', 'git');
+  } else if (process.platform === 'win32') {
+    candidates.push(
+      'git',
+      'C:/Program Files/Git/bin/git.exe',
+      'C:/Program Files/Git/cmd/git.exe',
+      'C:/Program Files (x86)/Git/bin/git.exe',
+      'C:/Program Files (x86)/Git/cmd/git.exe'
+    );
+  } else {
+    candidates.push('/usr/bin/git', '/usr/local/bin/git', 'git');
+  }
+
+  for (const p of candidates) {
+    try {
+      if (p.includes('/') || p.includes('\\')) {
+        if (fs.existsSync(p)) {
+          cachedGitPath = p;
+          return cachedGitPath;
+        }
+      } else {
+        // bare 'git' relies on PATH; keep as fallback
+        cachedGitPath = p;
+      }
+    } catch {
+      // ignore
+    }
+  }
+  return cachedGitPath || 'git';
+}
+
+function buildGitEnv() {
+  // Ensure PATH includes common locations when launched from Finder on macOS
+  let PATH = process.env.PATH || '';
+  if (process.platform === 'darwin') {
+    const extras = ['/opt/homebrew/bin', '/usr/local/bin'];
+    extras.forEach((dir) => {
+      if (!PATH.split(':').includes(dir)) PATH = `${PATH ? PATH + ':' : ''}${dir}`;
+    });
+  }
+  return { ...process.env, PATH };
+}
+
 function execGitCommand(basePath, args, options = {}) {
   const cwd = ensureAbsolutePath(basePath);
   const timeout = options.timeout ?? DEFAULT_GIT_TIMEOUT;
+  const gitBin = resolveGitPath();
+  const env = buildGitEnv();
 
   return new Promise((resolve) => {
-    execFile('git', ['-C', cwd, ...args], { timeout }, (err, stdout = '', stderr = '') => {
+    execFile(gitBin, ['-C', cwd, ...args], { timeout, env }, (err, stdout = '', stderr = '') => {
       if (err && err.code !== 1) {
-        resolve({ error: stderr.trim() || err.message, code: err.code || 1 });
+        const msg = stderr.toString().trim() || err.message || 'git error';
+        resolve({ error: msg, code: err.code || 1 });
         return;
       }
 
@@ -293,6 +349,79 @@ function parsePorcelainEntries(rawOutput, repoRoot) {
   return Array.from(byPath.values());
 }
 
+function parseCommitLogForFolder(logOutput, repoRoot, selectedFolderAbs) {
+  if (!logOutput) return [];
+
+  const normalizedFolder = ensureAbsolutePath(selectedFolderAbs);
+  const lines = logOutput.split(/\r?\n/);
+  const segments = [];
+  let current = null;
+
+  for (const line of lines) {
+    if (!line) {
+      if (current) {
+        if (current.files.length > 0) {
+          const timestamp = Number.isFinite(current.timestamp) ? current.timestamp : null;
+          segments.push({
+            hash: current.hash,
+            subject: current.subject,
+            timestamp,
+            isoDate:
+              typeof timestamp === 'number' ? new Date(timestamp * 1000).toISOString() : null,
+            files: current.files,
+          });
+        }
+        current = null;
+      }
+      continue;
+    }
+
+    if (line.includes('\u001f')) {
+      const [hash = '', ts = '', subject = ''] = line.split('\u001f');
+      const parsedTimestamp = Number.parseInt(ts, 10);
+      current = {
+        hash: hash.trim(),
+        subject: subject.trim(),
+        timestamp: Number.isFinite(parsedTimestamp) ? parsedTimestamp : undefined,
+        files: [],
+      };
+      continue;
+    }
+
+    if (!current) {
+      continue;
+    }
+
+    const relativePath = normalizePath(line.trim());
+    if (!relativePath) {
+      continue;
+    }
+
+    const absolutePath = normalizePath(path.join(repoRoot, relativePath));
+    if (normalizedFolder && !isPathWithin(absolutePath, normalizedFolder)) {
+      continue;
+    }
+
+    current.files.push({
+      relativePath,
+      absolutePath,
+    });
+  }
+
+  if (current && current.files.length > 0) {
+    const timestamp = Number.isFinite(current.timestamp) ? current.timestamp : null;
+    segments.push({
+      hash: current.hash,
+      subject: current.subject,
+      timestamp,
+      isoDate: typeof timestamp === 'number' ? new Date(timestamp * 1000).toISOString() : null,
+      files: current.files,
+    });
+  }
+
+  return segments;
+}
+
 function isPathWithin(targetPath, basePath) {
   const normalizedTarget = ensureAbsolutePath(targetPath);
   let normalizedBase = ensureAbsolutePath(basePath);
@@ -309,8 +438,7 @@ function isPathWithin(targetPath, basePath) {
   }
 
   return (
-    targetComparable === normalizedBase.slice(0, -1) ||
-    targetComparable.startsWith(normalizedBase)
+    targetComparable === normalizedBase.slice(0, -1) || targetComparable.startsWith(normalizedBase)
   );
 }
 
@@ -379,9 +507,7 @@ ipcMain.handle('get-commit-history', async (_event, { folderPath, limit = 20 } =
           hash,
           subject,
           timestamp: unixSeconds,
-          isoDate: Number.isFinite(unixSeconds)
-            ? new Date(unixSeconds * 1000).toISOString()
-            : null,
+          isoDate: Number.isFinite(unixSeconds) ? new Date(unixSeconds * 1000).toISOString() : null,
         };
       });
 
@@ -411,7 +537,11 @@ ipcMain.handle(
       const selectedFolderAbs = ensureAbsolutePath(folderPath);
 
       // Verify commit exists and get full hash
-      const verifyRes = await execGitCommand(repoRoot, ['rev-parse', '--verify', `${cleanCommit}^{commit}`]);
+      const verifyRes = await execGitCommand(repoRoot, [
+        'rev-parse',
+        '--verify',
+        `${cleanCommit}^{commit}`,
+      ]);
       if (verifyRes.error) return { error: `Commit '${cleanCommit}' not found in this repository` };
 
       const fullCommitHash = verifyRes.stdout.trim();
@@ -460,15 +590,63 @@ ipcMain.handle(
 
       console.log(`Files changed since commit ${cleanCommit}: ${committedFilesList.length}`);
 
+      // Step 1b: Build commit segments with ordering and metadata
+      let commitSegments = [];
+      try {
+        const segments = [];
+
+        const commitDetailRes = await execGitCommand(repoRoot, [
+          'show',
+          '--name-only',
+          '--diff-filter=ACMR',
+          '--pretty=format:%H%x1f%ct%x1f%s',
+          fullCommitHash,
+        ]);
+        if (!commitDetailRes.error && commitDetailRes.stdout) {
+          segments.push(
+            ...parseCommitLogForFolder(commitDetailRes.stdout, repoRoot, selectedFolderAbs)
+          );
+        }
+
+        const forwardLogRes = await execGitCommand(repoRoot, [
+          'log',
+          '--reverse',
+          '--pretty=format:%H%x1f%ct%x1f%s',
+          '--name-only',
+          '--diff-filter=ACMR',
+          `${fullCommitHash}..HEAD`,
+        ]);
+        if (!forwardLogRes.error && forwardLogRes.stdout) {
+          segments.push(
+            ...parseCommitLogForFolder(forwardLogRes.stdout, repoRoot, selectedFolderAbs)
+          );
+        }
+
+        commitSegments = segments
+          .filter((segment) => segment && segment.files && segment.files.length > 0)
+          .map((segment, index) => ({
+            ...segment,
+            order: index + 1,
+          }));
+      } catch (segmentError) {
+        console.warn('Failed to build commit segments for range:', segmentError);
+        commitSegments = [];
+      }
+
       // Step 2: Get all uncommitted changes separately
       let uncommittedFiles = [];
       if (includeWorkingTree) {
-        const statusRes = await execGitCommand(repoRoot, ['status', '--porcelain=v1', '-z', '-uall']);
+        const statusRes = await execGitCommand(repoRoot, [
+          'status',
+          '--porcelain=v1',
+          '-z',
+          '-uall',
+        ]);
 
         if (!statusRes.error && statusRes.stdout) {
           // Parse the porcelain output using the existing logic
           const entries = parsePorcelainEntries(statusRes.stdout, repoRoot);
-          uncommittedFiles = entries.filter(entry =>
+          uncommittedFiles = entries.filter((entry) =>
             isPathWithin(entry.absolutePath, selectedFolderAbs)
           );
           console.log(`Uncommitted changes found: ${uncommittedFiles.length}`);
@@ -479,7 +657,7 @@ ipcMain.handle(
       const allFilesMap = new Map();
 
       // First add committed files
-      committedFilesList.forEach(relPath => {
+      committedFilesList.forEach((relPath) => {
         const normalizedRel = normalizePath(relPath);
         const absPath = normalizePath(path.join(repoRoot, relPath));
 
@@ -488,14 +666,14 @@ ipcMain.handle(
             repoRoot,
             absolutePath: absPath,
             relativePath: normalizedRel,
-            status: 'M',  // Default status for committed files
+            status: 'M', // Default status for committed files
             isUntracked: false,
           });
         }
       });
 
       // Then add/override with uncommitted changes (these have more detailed status)
-      uncommittedFiles.forEach(entry => {
+      uncommittedFiles.forEach((entry) => {
         allFilesMap.set(entry.absolutePath, entry);
       });
 
@@ -506,7 +684,7 @@ ipcMain.handle(
       console.log(`  - Uncommitted changes: ${uncommittedFiles.length} files`);
       console.log(`  - Combined unique: ${finalFiles.length} files`);
 
-      return { repoRoot, files: finalFiles };
+      return { repoRoot, files: finalFiles, commitSegments };
     } catch (e) {
       console.error('Error in get-files-since-commit:', e);
       return { error: e?.message || 'Failed to load files for commit range' };
@@ -516,10 +694,7 @@ ipcMain.handle(
 
 ipcMain.handle(
   'get-selected-files-diff',
-  async (
-    _event,
-    { folderPath, filePaths = [], contextLines = 3 } = {}
-  ) => {
+  async (_event, { folderPath, filePaths = [], contextLines = 3, backloadedCommits = [] } = {}) => {
     if (!folderPath) return { error: 'No folder selected' };
     if (!Array.isArray(filePaths) || filePaths.length === 0) {
       return { diff: '', changedPaths: [] };
@@ -546,15 +721,104 @@ ipcMain.handle(
         })
         .filter(({ relativePath }) => relativePath && !relativePath.startsWith('..'));
 
+      const preparedCommitEntries = Array.isArray(backloadedCommits)
+        ? backloadedCommits
+            .map((rawEntry, index) => {
+              if (!rawEntry || typeof rawEntry.hash !== 'string') {
+                return null;
+              }
+
+              const order = Number.isFinite(Number(rawEntry.order))
+                ? Number(rawEntry.order)
+                : index + 1;
+              const subject =
+                typeof rawEntry.subject === 'string'
+                  ? rawEntry.subject
+                  : String(rawEntry.subject || '');
+              const timestamp =
+                typeof rawEntry.timestamp === 'number' && Number.isFinite(rawEntry.timestamp)
+                  ? rawEntry.timestamp
+                  : null;
+              const isoDate = typeof rawEntry.isoDate === 'string' ? rawEntry.isoDate : null;
+
+              const files = Array.isArray(rawEntry.files)
+                ? rawEntry.files
+                    .map((file) => {
+                      if (!file) return null;
+                      const absCandidate =
+                        typeof file === 'string'
+                          ? file
+                          : file.absolutePath || file.absPath || file.path || '';
+                      if (!absCandidate) return null;
+                      let absolutePath = normalizePath(absCandidate);
+                      if (!absolutePath) return null;
+                      if (!path.isAbsolute(absCandidate)) {
+                        absolutePath = normalizePath(path.join(repoRoot, absCandidate));
+                      }
+
+                      const relativeCandidate =
+                        typeof file === 'string'
+                          ? file
+                          : file.relativePath || file.repoRelativePath || '';
+                      let relativePath = relativeCandidate
+                        ? normalizePath(relativeCandidate)
+                        : safeRelativePath(repoRoot, absolutePath);
+                      if (!relativePath || relativePath.startsWith('..')) {
+                        const derived = safeRelativePath(repoRoot, absolutePath);
+                        if (!derived || derived.startsWith('..')) {
+                          return null;
+                        }
+                        relativePath = normalizePath(derived);
+                      }
+
+                      return {
+                        absolutePath,
+                        relativePath,
+                      };
+                    })
+                    .filter(Boolean)
+                : [];
+
+              if (!files.length) {
+                return null;
+              }
+
+              return {
+                hash: rawEntry.hash,
+                subject,
+                timestamp,
+                isoDate,
+                order,
+                files,
+              };
+            })
+            .filter(Boolean)
+        : [];
+
+      preparedCommitEntries.sort((a, b) => {
+        if (a.order !== b.order) return a.order - b.order;
+        return a.hash.localeCompare(b.hash);
+      });
+
       const tracked = [];
       const untracked = [];
-      const changedPaths = [];
+      const changedPathSet = new Set();
+      const annotations = [];
+      const annotationKeys = new Set();
 
       normalizedFiles.forEach(({ absolutePath, relativePath }) => {
         const entry = statusMap.get(normalizePath(relativePath));
         if (!entry) return;
 
-        changedPaths.push(absolutePath);
+        changedPathSet.add(absolutePath);
+        const annotationKey = `working:${absolutePath}`;
+        if (!annotationKeys.has(annotationKey)) {
+          annotations.push({
+            absolutePath,
+            source: 'working-tree',
+          });
+          annotationKeys.add(annotationKey);
+        }
         if (entry.isUntracked) {
           untracked.push({ absolutePath, relativePath });
         } else {
@@ -566,12 +830,14 @@ ipcMain.handle(
         `[GitDiff] Normalized ${normalizedFiles.length} file(s) -> ${tracked.length} tracked / ${untracked.length} untracked`
       );
 
-      if (tracked.length === 0 && untracked.length === 0) {
-        console.log('[GitDiff] No tracked or untracked entries matched requested files');
+      if (tracked.length === 0 && untracked.length === 0 && preparedCommitEntries.length === 0) {
+        console.log(
+          '[GitDiff] No tracked, untracked, or historical commit entries matched requested files'
+        );
         return { diff: '', changedPaths: [] };
       }
 
-      let diffOutput = '';
+      const diffParts = [];
 
       if (tracked.length > 0) {
         const trackedArgs = [
@@ -582,8 +848,8 @@ ipcMain.handle(
           ...tracked.map((item) => item.relativePath),
         ];
         const trackedDiff = await execGitCommand(repoRoot, trackedArgs, { timeout: 20000 });
-        if (!trackedDiff.error) {
-          diffOutput += trackedDiff.stdout;
+        if (!trackedDiff.error && trackedDiff.stdout) {
+          diffParts.push(trackedDiff.stdout.trimEnd());
         } else {
           console.warn('[GitDiff] tracked diff command returned error:', trackedDiff.error);
         }
@@ -599,20 +865,70 @@ ipcMain.handle(
           item.absolutePath,
         ]);
 
-        if (!untrackedDiff.error) {
-          diffOutput += untrackedDiff.stdout;
+        if (!untrackedDiff.error && untrackedDiff.stdout) {
+          diffParts.push(untrackedDiff.stdout.trimEnd());
         } else {
           console.warn('[GitDiff] untracked diff command returned error:', untrackedDiff.error);
         }
       }
 
+      for (const commitEntry of preparedCommitEntries) {
+        const commitAnnotationKeyPrefix = `commit:${commitEntry.hash}:`;
+
+        commitEntry.files.forEach((file) => {
+          changedPathSet.add(file.absolutePath);
+          const annotationKey = `${commitAnnotationKeyPrefix}${file.absolutePath}`;
+          if (!annotationKeys.has(annotationKey)) {
+            annotations.push({
+              absolutePath: file.absolutePath,
+              source: 'commit',
+              commitHash: commitEntry.hash,
+              commitOrder: commitEntry.order,
+            });
+            annotationKeys.add(annotationKey);
+          }
+        });
+
+        const commitArgs = [
+          'show',
+          `-U${Math.max(Number(contextLines) || 3, 0)}`,
+          '--pretty=format:',
+          commitEntry.hash,
+          '--',
+          ...commitEntry.files.map((file) => file.relativePath),
+        ];
+
+        const commitDiff = await execGitCommand(repoRoot, commitArgs, { timeout: 20000 });
+        if (commitDiff.error || !commitDiff.stdout) {
+          console.warn(
+            `[GitDiff] commit diff command returned error for ${commitEntry.hash}:`,
+            commitDiff.error
+          );
+          continue;
+        }
+
+        const shortHash = commitEntry.hash.slice(0, 7);
+        const paddedOrder = String(commitEntry.order).padStart(2, '0');
+        const headerLines = [`# Commit ${paddedOrder} ${shortHash} ${commitEntry.subject || ''}`];
+        if (commitEntry.isoDate) {
+          headerLines.push(`# Date ${commitEntry.isoDate}`);
+        }
+
+        const commitSection = `${headerLines.join('\n')}\n${commitDiff.stdout.trimEnd()}`;
+        diffParts.push(commitSection);
+      }
+
       console.log(
-        `[GitDiff] Built diff output of ${diffOutput.length} characters for ${changedPaths.length} path(s)`
+        `[GitDiff] Built diff output with ${diffParts.length} section(s) for ${changedPathSet.size} path(s)`
       );
 
+      const combinedDiff = diffParts.filter(Boolean).join('\n\n');
+      const changedPaths = Array.from(changedPathSet);
+
       return {
-        diff: diffOutput.trimEnd(),
+        diff: combinedDiff.trimEnd(),
         changedPaths,
+        annotatedPaths: annotations,
       };
     } catch (e) {
       return { error: e?.message || 'Failed to build diff for selected files' };
@@ -1067,7 +1383,7 @@ function createWindow() {
     mainWindow.webContents.openDevTools();
   } else {
     const prodPath = app.isPackaged
-      ? path.join(process.resourcesPath, 'app.asar', 'dist', 'index.html')
+      ? path.join(process.resourcesPath, 'app.asar', 'electron', 'dist', 'index.html')
       : path.join(__dirname, 'dist', 'index.html');
 
     console.log('--- PRODUCTION LOAD ---');

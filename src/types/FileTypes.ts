@@ -1,4 +1,9 @@
-import type { GitChangedFile, GitCommitSummary } from './GitTypes';
+import type {
+  GitChangedFile,
+  GitCommitSummary,
+  GitCommitBackloadSegment,
+  GitDiffPathAnnotation,
+} from './GitTypes';
 
 export type IgnoreMode = 'automatic' | 'global';
 // Hot reload occurs when mode changes.
@@ -51,6 +56,8 @@ export interface SidebarProps {
   isCommitHistoryLoading: boolean;
   commitHistoryError: string | null;
   selectedDiffPaths: string[];
+  diffAnnotations: GitDiffPathAnnotation[];
+  backloadedCommitSegments: GitCommitBackloadSegment[];
   expandedNodes: Record<string, boolean>;
   toggleExpanded: (nodeId: string) => void;
   includeBinaryPaths: boolean;

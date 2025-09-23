@@ -79,18 +79,15 @@ async function loadOfflineEncoder(): Promise<EncoderLike | null> {
 
   offlineEncoderPromise = (async () => {
     try {
-      if (typeof window === 'undefined') {
-        const mod = await import('tiktoken');
-        if (mod && typeof mod.get_encoding === 'function') {
-          return mod.get_encoding('o200k_base');
-        }
-        return null;
-      }
-
-      const [{ Tiktoken }, model] = await Promise.all([
-        import('tiktoken/lite'),
+      // Initialize wasm via Vite-compatible URL flow and use lite encoder
+      const [{ init, Tiktoken }, model, wasmUrl] = await Promise.all([
+        import('tiktoken/lite/init'),
         import('tiktoken/encoders/o200k_base.json'),
-      ]);
+        import('tiktoken/lite/tiktoken_bg.wasm?url'),
+      ] as const);
+
+      // Initialize the WASM module using instantiateStreaming
+      await init((imports: any) => WebAssembly.instantiateStreaming(fetch(wasmUrl as unknown as string), imports));
 
       return new Tiktoken(model.bpe_ranks, model.special_tokens, model.pat_str);
     } catch (error) {

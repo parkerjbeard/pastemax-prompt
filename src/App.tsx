@@ -4,7 +4,12 @@ import ConfirmUseFolderModal from './components/ConfirmUseFolderModal';
 import Sidebar from './components/Sidebar';
 import FileList from './components/FileList';
 import { FileData, IgnoreMode } from './types/FileTypes';
-import type { GitChangedFile, GitCommitSummary } from './types/GitTypes';
+import type {
+  GitChangedFile,
+  GitCommitSummary,
+  GitCommitBackloadSegment,
+  GitDiffPathAnnotation,
+} from './types/GitTypes';
 import { ThemeProvider } from './context/ThemeContext';
 import IgnoreListModal from './components/IgnoreListModal';
 import ThemeToggle from './components/ThemeToggle';
@@ -36,6 +41,7 @@ import SavedPromptsDropdown from './components/SavedPromptsDropdown';
  * While not all utilities are used directly, they're kept for consistency and future use.
  */
 import { normalizePath, arePathsEqual, isSubPath, dirname } from './utils/pathUtils';
+import { sanitizeIncomingFileData, sanitizeIncomingFileList } from './utils/fileDataSanitizer';
 
 /**
  * Import utility functions for content formatting and language detection.
@@ -223,6 +229,10 @@ const App = (): JSX.Element => {
   const [commitHistoryError, setCommitHistoryError] = useState<string | null>(null);
   const [selectedFilesDiff, setSelectedFilesDiff] = useState('');
   const [selectedDiffPaths, setSelectedDiffPaths] = useState<string[]>([]);
+  const [backloadedCommitSegments, setBackloadedCommitSegments] = useState<
+    GitCommitBackloadSegment[]
+  >([]);
+  const [diffPathAnnotations, setDiffPathAnnotations] = useState<GitDiffPathAnnotation[]>([]);
 
   /* ============================== STATE: UI Controls ============================== */
   const [sortDropdownOpen, setSortDropdownOpen] = useState(false);
@@ -286,6 +296,10 @@ const App = (): JSX.Element => {
     setSelectedFolder(null);
     setAllFiles([]);
     setSelectedFiles([]);
+    setBackloadedCommitSegments([]);
+    setSelectedFilesDiff('');
+    setSelectedDiffPaths([]);
+    setDiffPathAnnotations([]);
     setDisplayedFiles([]);
     setSearchTerm('');
     setSortOrder('tokens-desc');
@@ -318,6 +332,10 @@ const App = (): JSX.Element => {
     setSelectedFolder(null);
     setAllFiles([]);
     setSelectedFiles([]);
+    setBackloadedCommitSegments([]);
+    setSelectedFilesDiff('');
+    setSelectedDiffPaths([]);
+    setDiffPathAnnotations([]);
     setDisplayedFiles([]);
 
     // Restore task type if it was saved
@@ -592,6 +610,10 @@ const App = (): JSX.Element => {
       // Clear selections if folder changed
       if (!arePathsEqual(normalizedFolderPath, selectedFolder)) {
         setSelectedFiles([]);
+        setBackloadedCommitSegments([]);
+        setSelectedFilesDiff('');
+        setSelectedDiffPaths([]);
+        setDiffPathAnnotations([]);
       }
 
       // Update current workspace's folder path if a workspace is active
@@ -633,22 +655,38 @@ const App = (): JSX.Element => {
   );
 
   const stableHandleFileListData = useCallback(
-    (files: FileData[]) => {
+    (files: any[]) => {
+      if (!Array.isArray(files)) {
+        console.warn('[handleFileListData] Expected an array of files but received:', files);
+      }
+
+      const incomingList = Array.isArray(files) ? files : [];
+      const cleaned = sanitizeIncomingFileList(incomingList);
+
+      const nonStringNames = incomingList.filter((file) => file && typeof file.name !== 'string');
+      if (nonStringNames.length > 0) {
+        console.warn(
+          `[handleFileListData] Normalized ${nonStringNames.length} file name${
+            nonStringNames.length === 1 ? '' : 's'
+          } arriving as non-strings`
+        );
+      }
+
       setAllFiles((prevFiles: FileData[]) => {
-        if (files.length !== prevFiles.length) {
+        if (cleaned.length !== prevFiles.length) {
           console.debug(
             '[handleFileListData] Updating files from',
             prevFiles.length,
             'to',
-            files.length
+            cleaned.length
           );
         }
-        return files;
+        return cleaned;
       });
 
       setProcessingStatus({
         status: 'complete',
-        message: `Loaded ${files.length} files`,
+        message: `Loaded ${cleaned.length} files`,
       });
 
       setSelectedFiles((prevSelected: string[]) => {
@@ -656,12 +694,12 @@ const App = (): JSX.Element => {
         if (prevSelected.length > 0) {
           // Only filter out files that no longer exist in the new list
           return prevSelected.filter((selectedPath: string) =>
-            files.some((file) => arePathsEqual(file.path, selectedPath))
+            cleaned.some((file) => arePathsEqual(file.path, selectedPath))
           );
         }
 
         // No previous selections - select all eligible files
-        return files
+        return cleaned
           .filter(
             (file: FileData) =>
               !file.isSkipped && !file.excludedByDefault && (includeBinaryPaths || !file.isBinary)
@@ -858,11 +896,17 @@ const App = (): JSX.Element => {
   // File event handlers with proper typing
   const handleFileAdded = useCallback((newFile: FileData) => {
     console.log('[IPC] Received file-added:', newFile);
+    const sanitized = sanitizeIncomingFileData(newFile);
+    if (!sanitized) {
+      console.warn('[IPC] Ignored file-added payload without a valid path');
+      return;
+    }
+
     setAllFiles((prevFiles: FileData[]) => {
-      const isDuplicate = prevFiles.some((f) => arePathsEqual(f.path, newFile.path));
-      const newAllFiles = isDuplicate ? prevFiles : [...prevFiles, newFile];
+      const isDuplicate = prevFiles.some((f) => arePathsEqual(f.path, sanitized.path));
+      const newAllFiles = isDuplicate ? prevFiles : [...prevFiles, sanitized];
       console.log(
-        `[IPC] file-added: Previous count: ${prevFiles.length}, New count: ${newAllFiles.length}, Path: ${newFile.path}`
+        `[IPC] file-added: Previous count: ${prevFiles.length}, New count: ${newAllFiles.length}, Path: ${sanitized.path}`
       );
       return newAllFiles;
     });
@@ -870,12 +914,18 @@ const App = (): JSX.Element => {
 
   const handleFileUpdated = useCallback((updatedFile: FileData) => {
     console.log('[IPC] Received file-updated:', updatedFile);
+    const sanitized = sanitizeIncomingFileData(updatedFile);
+    if (!sanitized) {
+      console.warn('[IPC] Ignored file-updated payload without a valid path');
+      return;
+    }
+
     setAllFiles((prevFiles: FileData[]) => {
       const newAllFiles = prevFiles.map((file) =>
-        arePathsEqual(file.path, updatedFile.path) ? updatedFile : file
+        arePathsEqual(file.path, sanitized.path) ? sanitized : file
       );
       console.log(
-        `[IPC] file-updated: Count remains: ${newAllFiles.length}, Updated path: ${updatedFile.path}`
+        `[IPC] file-updated: Count remains: ${newAllFiles.length}, Updated path: ${sanitized.path}`
       );
       return newAllFiles;
     });
@@ -1446,6 +1496,10 @@ const App = (): JSX.Element => {
       setSelectedFolder(null);
       localStorage.removeItem(STORAGE_KEYS.SELECTED_FOLDER);
       setSelectedFiles([]);
+      setBackloadedCommitSegments([]);
+      setSelectedFilesDiff('');
+      setSelectedDiffPaths([]);
+      setDiffPathAnnotations([]);
       setAllFiles([]);
       setProcessingStatus({
         status: 'idle',
@@ -1496,6 +1550,10 @@ const App = (): JSX.Element => {
       localStorage.removeItem(STORAGE_KEYS.SELECTED_FOLDER);
       localStorage.removeItem(STORAGE_KEYS.SELECTED_FILES);
       setSelectedFiles([]);
+      setBackloadedCommitSegments([]);
+      setSelectedFilesDiff('');
+      setSelectedDiffPaths([]);
+      setDiffPathAnnotations([]);
       setAllFiles([]);
       setProcessingStatus({
         status: 'idle',
@@ -1527,6 +1585,10 @@ const App = (): JSX.Element => {
     localStorage.removeItem(STORAGE_KEYS.SELECTED_FOLDER);
     localStorage.removeItem(STORAGE_KEYS.SELECTED_FILES);
     setSelectedFiles([]);
+    setBackloadedCommitSegments([]);
+    setSelectedFilesDiff('');
+    setSelectedDiffPaths([]);
+    setDiffPathAnnotations([]);
     setAllFiles([]);
     setProcessingStatus({
       status: 'idle',
@@ -1575,6 +1637,10 @@ const App = (): JSX.Element => {
       setSelectedFolder(null);
       localStorage.removeItem(STORAGE_KEYS.SELECTED_FOLDER);
       setSelectedFiles([]);
+      setBackloadedCommitSegments([]);
+      setSelectedFilesDiff('');
+      setSelectedDiffPaths([]);
+      setDiffPathAnnotations([]);
       setAllFiles([]);
       setProcessingStatus({
         status: 'idle',
@@ -1611,6 +1677,10 @@ const App = (): JSX.Element => {
         localStorage.removeItem(STORAGE_KEYS.SELECTED_FOLDER);
         setSelectedFolder(null);
         setSelectedFiles([]);
+        setBackloadedCommitSegments([]);
+        setSelectedFilesDiff('');
+        setSelectedDiffPaths([]);
+        setDiffPathAnnotations([]);
         setAllFiles([]);
         setProcessingStatus({
           status: 'idle',
@@ -1650,8 +1720,9 @@ const App = (): JSX.Element => {
         ? result.files
             .map((file: any) => {
               if (!file) return null;
+              const absCandidate = file.absolutePath || file.absPath || file.path || file;
               const absolutePath = normalizePath(
-                file.absolutePath || file.absPath || file.path || file
+                typeof absCandidate === 'string' ? absCandidate : String(absCandidate || '')
               );
               if (!absolutePath) return null;
 
@@ -1669,15 +1740,28 @@ const App = (): JSX.Element => {
                     ? status[1]
                     : '';
 
+              const relCandidate = file.relativePath || file.repoRelativePath || '';
+              const relativePath = relCandidate
+                ? normalizePath(
+                    typeof relCandidate === 'string' ? relCandidate : String(relCandidate)
+                  )
+                : '';
+
+              const oldRelCandidate = file.oldRelativePath;
+
               return {
                 absolutePath,
-                relativePath: normalizePath(file.relativePath || file.repoRelativePath || ''),
+                relativePath,
                 status,
                 indexStatus,
                 worktreeStatus,
                 isUntracked: Boolean(file.isUntracked || status === '??'),
-                oldRelativePath: file.oldRelativePath
-                  ? normalizePath(file.oldRelativePath)
+                oldRelativePath: oldRelCandidate
+                  ? normalizePath(
+                      typeof oldRelCandidate === 'string'
+                        ? oldRelCandidate
+                        : String(oldRelCandidate)
+                    )
                   : undefined,
               } as GitChangedFile;
             })
@@ -1837,6 +1921,7 @@ const App = (): JSX.Element => {
     if (!isElectron || !selectedFolder || selectedFiles.length === 0) {
       setSelectedFilesDiff('');
       setSelectedDiffPaths([]);
+      setDiffPathAnnotations([]);
       return;
     }
 
@@ -1845,9 +1930,42 @@ const App = (): JSX.Element => {
 
     const loadDiff = async () => {
       try {
+        const selectedSet = new Set(selectedFiles.map((path) => normalizePath(path)));
+        const commitPayload = backloadedCommitSegments
+          .map((segment) => {
+            const files = segment.files
+              .map((file) => {
+                const normalizedAbs = normalizePath(file.absolutePath);
+                if (!selectedSet.has(normalizedAbs)) {
+                  return null;
+                }
+                const relativePath = file.relativePath ? normalizePath(file.relativePath) : '';
+                return {
+                  absolutePath: normalizedAbs,
+                  relativePath,
+                };
+              })
+              .filter(Boolean);
+
+            if (files.length === 0) {
+              return null;
+            }
+
+            return {
+              hash: segment.hash,
+              subject: segment.subject,
+              timestamp: segment.timestamp,
+              isoDate: segment.isoDate,
+              order: segment.order,
+              files,
+            };
+          })
+          .filter(Boolean);
+
         const diffPayload = {
           folderPath: selectedFolder,
           filePaths: selectedFiles,
+          backloadedCommits: commitPayload,
         };
 
         const invokeGetSelectedDiff = window.electron.getSelectedFilesDiff
@@ -1871,6 +1989,27 @@ const App = (): JSX.Element => {
         const changed = Array.isArray(result.changedPaths)
           ? result.changedPaths.map((p: string) => normalizePath(p))
           : [];
+        const annotations = Array.isArray(result.annotatedPaths)
+          ? (result.annotatedPaths as any[])
+              .map((entry: any) => {
+                if (!entry) return null;
+                const absolutePath = normalizePath(entry.absolutePath || entry.path || '');
+                if (!absolutePath) return null;
+                const source = entry.source === 'commit' ? 'commit' : 'working-tree';
+                const commitHash =
+                  typeof entry.commitHash === 'string' ? entry.commitHash : undefined;
+                const commitOrder = Number.isFinite(Number(entry.commitOrder))
+                  ? Number(entry.commitOrder)
+                  : undefined;
+                return {
+                  absolutePath,
+                  source,
+                  commitHash,
+                  commitOrder,
+                } as GitDiffPathAnnotation;
+              })
+              .filter(Boolean)
+          : [];
 
         console.debug(
           `[GitDiff] Renderer received diff length ${diffText.length} for ${changed.length} path(s)`
@@ -1878,11 +2017,13 @@ const App = (): JSX.Element => {
 
         setSelectedFilesDiff(diffText);
         setSelectedDiffPaths(changed);
+        setDiffPathAnnotations(annotations);
       } catch (error) {
         if (!cancelled) {
           console.warn('Failed to compute git diff for selection', error);
           setSelectedFilesDiff('');
           setSelectedDiffPaths([]);
+          setDiffPathAnnotations([]);
         }
       }
     };
@@ -1896,7 +2037,7 @@ const App = (): JSX.Element => {
         clearTimeout(timeoutId);
       }
     };
-  }, [isElectron, selectedFolder, selectedFiles]);
+  }, [isElectron, selectedFolder, selectedFiles, backloadedCommitSegments]);
 
   const handleAddFilesSinceCommit = async (commitHash: string) => {
     if (!selectedFolder) return;
@@ -1945,15 +2086,13 @@ const App = (): JSX.Element => {
         return;
       }
 
-      const pathSet = new Set(absolutePaths.map((p) => normalizePath(p)));
+      const eligible = absolutePaths.filter((absPath) => {
+        const file = allFiles.find((f: FileData) => arePathsEqual(f.path, absPath));
+        if (!file) return false;
+        return !file.isSkipped && !file.excludedByDefault && (includeBinaryPaths || !file.isBinary);
+      });
 
-      const eligible = allFiles
-        .filter((f: FileData) => pathSet.has(normalizePath(f.path)))
-        .filter(
-          (f: FileData) =>
-            !f.isSkipped && !f.excludedByDefault && (includeBinaryPaths || !f.isBinary)
-        )
-        .map((f: FileData) => normalizePath(f.path));
+      const eligibleSet = new Set(eligible);
 
       if (eligible.length === 0) {
         setProcessingStatus({
@@ -1961,6 +2100,126 @@ const App = (): JSX.Element => {
           message: 'No matching files passed current filters',
         });
         return;
+      }
+
+      const rawCommitSegments = Array.isArray(result.commitSegments)
+        ? (result.commitSegments as any[])
+        : [];
+
+      if (rawCommitSegments.length > 0) {
+        const normalizedSegments = rawCommitSegments
+          .map((segment: any) => {
+            if (!segment) return null;
+            const rawFiles = Array.isArray(segment.files) ? segment.files : [];
+            const files = rawFiles
+              .map((file: any) => {
+                if (!file) return null;
+                const absCandidate =
+                  typeof file === 'string'
+                    ? file
+                    : file.absolutePath || file.absPath || file.path || '';
+                const absolutePath = normalizePath(absCandidate);
+                if (!absolutePath || !eligibleSet.has(absolutePath)) {
+                  return null;
+                }
+
+                const relativeCandidate =
+                  typeof file === 'string'
+                    ? file
+                    : file.relativePath || file.repoRelativePath || '';
+                const relativePath = relativeCandidate ? normalizePath(relativeCandidate) : '';
+
+                return {
+                  absolutePath,
+                  relativePath,
+                };
+              })
+              .filter(Boolean);
+
+            if (files.length === 0) return null;
+
+            const orderValue = Number.isFinite(Number(segment.order))
+              ? Number(segment.order)
+              : Number.MAX_SAFE_INTEGER;
+
+            return {
+              hash: typeof segment.hash === 'string' ? segment.hash : String(segment.hash || ''),
+              subject:
+                typeof segment.subject === 'string'
+                  ? segment.subject
+                  : String(segment.subject || ''),
+              timestamp:
+                typeof segment.timestamp === 'number' && Number.isFinite(segment.timestamp)
+                  ? segment.timestamp
+                  : null,
+              isoDate: typeof segment.isoDate === 'string' ? segment.isoDate : null,
+              order: orderValue,
+              files,
+            } as GitCommitBackloadSegment;
+          })
+          .filter(Boolean) as GitCommitBackloadSegment[];
+
+        if (normalizedSegments.length > 0) {
+          setBackloadedCommitSegments((previous) => {
+            const byHash = new Map<string, GitCommitBackloadSegment>();
+            previous.forEach((segment) => {
+              byHash.set(segment.hash, {
+                ...segment,
+                files: [...segment.files],
+              });
+            });
+
+            normalizedSegments.forEach((segment) => {
+              const existing = byHash.get(segment.hash);
+              if (existing) {
+                const existingPaths = new Set(
+                  existing.files.map((file) => normalizePath(file.absolutePath))
+                );
+                segment.files.forEach((file) => {
+                  const normalizedAbs = normalizePath(file.absolutePath);
+                  if (!existingPaths.has(normalizedAbs)) {
+                    existing.files.push({ ...file, absolutePath: normalizedAbs });
+                    existingPaths.add(normalizedAbs);
+                  }
+                });
+                existing.order = Math.min(existing.order, segment.order);
+                if (!existing.subject && segment.subject) {
+                  existing.subject = segment.subject;
+                }
+                if (!existing.isoDate && segment.isoDate) {
+                  existing.isoDate = segment.isoDate;
+                }
+                if (existing.timestamp == null && segment.timestamp != null) {
+                  existing.timestamp = segment.timestamp;
+                }
+              } else {
+                byHash.set(segment.hash, {
+                  ...segment,
+                  files: segment.files.map((file) => ({
+                    ...file,
+                    absolutePath: normalizePath(file.absolutePath),
+                  })),
+                });
+              }
+            });
+
+            const merged = Array.from(byHash.values()).filter(
+              (segment) => segment.files.length > 0
+            );
+            merged.sort((a, b) => {
+              if (a.timestamp != null && b.timestamp != null && a.timestamp !== b.timestamp) {
+                return a.timestamp - b.timestamp;
+              }
+              if (a.order !== b.order) return a.order - b.order;
+              return a.hash.localeCompare(b.hash);
+            });
+
+            return merged.map((segment, index) => ({
+              ...segment,
+              order: index + 1,
+            }));
+          });
+        }
       }
 
       setSelectedFiles((prev: string[]) => {
@@ -2072,9 +2331,7 @@ const App = (): JSX.Element => {
 
     const fallback = Math.floor((diffTokenEstimate + changedFileTokens) * 0.8);
     const suggested =
-      Number.isFinite(recommended) && recommended > 0
-        ? recommended
-        : Math.max(1000, fallback);
+      Number.isFinite(recommended) && recommended > 0 ? recommended : Math.max(1000, fallback);
 
     // Do not reduce a user-entered larger budget. Only raise if suggestion is higher.
     setSmartContextBudgetTokens((prev) => Math.max(prev, suggested));
@@ -2245,6 +2502,8 @@ const App = (): JSX.Element => {
               isCommitHistoryLoading={isCommitHistoryLoading}
               commitHistoryError={commitHistoryError}
               selectedDiffPaths={selectedDiffPaths}
+              diffAnnotations={diffPathAnnotations}
+              backloadedCommitSegments={backloadedCommitSegments}
               expandedNodes={expandedNodes}
               toggleExpanded={toggleExpanded}
               includeBinaryPaths={includeBinaryPaths}

@@ -256,7 +256,7 @@ const TreeItem = ({
           {type === 'directory' ? <Folder size={16} /> : <File size={16} />}
         </div>
 
-        <div className="tree-item-name">{name}</div>
+        <div className="tree-item-name">{typeof name === 'string' ? name : String(name)}</div>
 
         {/* Show token count for files that have it */}
         {fileData && fileData.tokenCount > 0 && (
